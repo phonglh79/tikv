@@ -275,11 +275,17 @@ impl<T: FnOnce()> DeferContext<T> {
     pub fn new(t: T) -> DeferContext<T> {
         DeferContext { t: Some(t) }
     }
+
+    pub fn take(&mut self) -> Option<T> {
+        self.t.take()
+    }
 }
 
 impl<T: FnOnce()> Drop for DeferContext<T> {
     fn drop(&mut self) {
-        self.t.take().unwrap()()
+        if let Some(f) = self.take() {
+            f()
+        }
     }
 }
 
@@ -430,6 +436,37 @@ mod tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::*;
+
+    #[test]
+    fn test_defer_context() {
+        let mut counter = 0;
+
+        // Dropping DeferContext invokes the closure.
+        {
+            DeferContext::new(|| {
+                counter += 1;
+            });
+        }
+        assert_eq!(counter, 1);
+
+        // Take the closure before dropping the DeferContext.
+        {
+            let mut d = DeferContext::new(|| {
+                counter += 1;
+            });
+            d.take();
+        }
+        assert_eq!(counter, 1);
+
+        // Take and invoke the closure before dropping the DeferContext.
+        {
+            let mut d = DeferContext::new(|| {
+                counter += 1;
+            });
+            d.take().unwrap()();
+        }
+        assert_eq!(counter, 2);
+    }
 
     #[test]
     fn test_to_socket_addr() {
