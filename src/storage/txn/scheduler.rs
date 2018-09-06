@@ -34,118 +34,67 @@
 use std::fmt::{self, Debug, Display, Formatter};
 use std::u64;
 
-use kvproto::kvrpcpb::{CommandPri, Context};
+use kvproto::kvrpcpb::CommandPri;
 
-use storage::engine::{Callback as EngineCallback, CbContext, Modify, Result as EngineResult};
+use storage::engine::{CbContext, Result as EngineResult};
 use storage::Key;
 use storage::{Command, Engine, Error as StorageError, StorageCb};
 use util::collections::HashMap;
 use util::threadpool::{ThreadPool, ThreadPoolBuilder};
 use util::time::SlowTimer;
-use util::worker::{self, Runnable, ScheduleError};
+use util::worker::{self, Runnable};
 
 use super::super::metrics::*;
 use super::latch::{Latches, Lock};
-use super::process::{execute_callback, ProcessResult, SchedContext, Task};
+use super::process::{
+    execute_callback, handle_snapshot_finished, ProcessResult, SchedContext, SchedContextFactory,
+    Task,
+};
 use super::Error;
 
 pub const CMD_BATCH_SIZE: usize = 256;
 
 /// Message types for the scheduler event loop.
-pub enum Msg<E: Engine> {
+pub enum Msg {
     Quit,
     RawCmd {
         cmd: Command,
         cb: StorageCb,
     },
-    SnapshotFinished {
-        cid: u64,
-        cb_ctx: CbContext,
-        snapshot: EngineResult<E::Snap>,
-    },
     ReadFinished {
-        cid: u64,
+        rctx: Task,
         pr: ProcessResult,
-    },
-    WritePrepareFinished {
-        cid: u64,
-        ctx: Context,
-        tag: &'static str,
-        pr: ProcessResult,
-        to_be_write: Vec<Modify>,
-        rows: usize,
-    },
-    WritePrepareFailed {
-        cid: u64,
-        err: Error,
     },
     WriteFinished {
-        cid: u64,
+        rctx: Task,
         pr: ProcessResult,
         cb_ctx: CbContext,
         result: EngineResult<()>,
     },
+    FinishedWithErr {
+        rctx: Task,
+        err: Error,
+    },
 }
 
 /// Debug for messages.
-impl<E: Engine> Debug for Msg<E> {
+impl Debug for Msg {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "{}", self)
     }
 }
 
 /// Display for messages.
-impl<E: Engine> Display for Msg<E> {
+impl Display for Msg {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match *self {
             Msg::Quit => write!(f, "Quit"),
             Msg::RawCmd { ref cmd, .. } => write!(f, "RawCmd {:?}", cmd),
-            Msg::SnapshotFinished { cid, .. } => write!(f, "SnapshotFinished [cid={}]", cid),
-            Msg::ReadFinished { cid, .. } => write!(f, "ReadFinished [cid={}]", cid),
-            Msg::WritePrepareFinished {
-                cid, ref ctx, tag, ..
-            } => write!(
-                f,
-                "WritePrepareFinished [cid={}, tag={}, ctx={:?}]",
-                cid, tag, ctx
-            ),
-            Msg::WritePrepareFailed { cid, ref err } => {
-                write!(f, "WritePrepareFailed [cid={}, err={:?}]", cid, err)
-            }
-            Msg::WriteFinished { cid, .. } => write!(f, "WriteFinished [cid={}]", cid),
+            Msg::ReadFinished { ref rctx, .. } => write!(f, "ReadFinished [cid={}]", rctx.cid),
+            Msg::WriteFinished { ref rctx, .. } => write!(f, "WriteFinished [cid={}]", rctx.cid),
+            Msg::FinishedWithErr { ref rctx, .. } => write!(f, "WriteFinished [cid={}]", rctx.cid),
         }
     }
-}
-
-/// Creates a callback to receive async results of write prepare from the storage engine.
-fn make_engine_cb<E: Engine>(
-    cmd: &'static str,
-    cid: u64,
-    pr: ProcessResult,
-    scheduler: worker::Scheduler<Msg<E>>,
-    rows: usize,
-) -> EngineCallback<()> {
-    Box::new(move |(cb_ctx, result)| {
-        match scheduler.schedule(Msg::WriteFinished {
-            cid,
-            pr,
-            cb_ctx,
-            result,
-        }) {
-            Ok(_) => {
-                KV_COMMAND_KEYWRITE_HISTOGRAM_VEC
-                    .with_label_values(&[cmd])
-                    .observe(rows as f64);
-            }
-            e @ Err(ScheduleError::Stopped(_)) => info!("scheduler worker stopped, {:?}", e),
-            Err(e) => {
-                panic!(
-                    "schedule WriteFinished msg failed, cid={}, err:{:?}",
-                    cid, e
-                );
-            }
-        }
-    })
 }
 
 /// Scheduler which schedules the execution of `storage::Command`s.
@@ -156,7 +105,7 @@ pub struct Scheduler<E: Engine> {
     pub cmd_ctxs: HashMap<u64, Task>,
 
     // actual scheduler to schedule the execution of commands
-    pub scheduler: worker::Scheduler<Msg<E>>,
+    pub scheduler: worker::Scheduler<Msg>,
 
     // cmd id generator
     id_alloc: u64,
@@ -169,10 +118,10 @@ pub struct Scheduler<E: Engine> {
     sched_pending_write_threshold: usize,
 
     // worker pool
-    worker_pool: ThreadPool<SchedContext>,
+    worker_pool: ThreadPool<SchedContext<E>>,
 
     // high priority commands will be delivered to this pool
-    high_priority_pool: ThreadPool<SchedContext>,
+    high_priority_pool: ThreadPool<SchedContext<E>>,
 
     // used to control write flow
     running_write_bytes: usize,
@@ -182,11 +131,12 @@ impl<E: Engine> Scheduler<E> {
     /// Creates a scheduler.
     pub fn new(
         engine: E,
-        scheduler: worker::Scheduler<Msg<E>>,
+        scheduler: worker::Scheduler<Msg>,
         concurrency: usize,
         worker_pool_size: usize,
         sched_pending_write_threshold: usize,
     ) -> Self {
+        let factory = SchedContextFactory::new(engine.clone());
         Scheduler {
             engine,
             cmd_ctxs: Default::default(),
@@ -194,12 +144,11 @@ impl<E: Engine> Scheduler<E> {
             id_alloc: 0,
             latches: Latches::new(concurrency),
             sched_pending_write_threshold,
-            worker_pool: ThreadPoolBuilder::with_default_factory(thd_name!("sched-worker-pool"))
+            worker_pool: ThreadPoolBuilder::new(thd_name!("sched-worker-pool"), factory.clone())
                 .thread_count(worker_pool_size)
                 .build(),
-            high_priority_pool: ThreadPoolBuilder::with_default_factory(thd_name!(
-                "sched-high-pri-pool"
-            )).build(),
+            high_priority_pool: ThreadPoolBuilder::new(thd_name!("sched-high-pri-pool"), factory)
+                .build(),
             running_write_bytes: 0,
         }
     }
@@ -223,22 +172,20 @@ impl<E: Engine> Scheduler<E> {
     }
 
     fn remove_ctx(&mut self, cid: u64) -> Task {
-        let ctx = self.cmd_ctxs.remove(&cid).unwrap();
-        assert_eq!(ctx.cid, cid);
-        if ctx.lock.is_write_lock() {
-            self.running_write_bytes -= ctx.write_bytes;
+        let rctx = self.cmd_ctxs.remove(&cid).unwrap();
+        assert_eq!(rctx.cid, cid);
+        rctx
+    }
+
+    fn on_command_finished(&mut self, rctx: Task) {
+        if rctx.lock.is_write_lock() {
+            self.running_write_bytes -= rctx.write_bytes;
         }
         SCHED_WRITING_BYTES_GAUGE.set(self.running_write_bytes as i64);
         SCHED_CONTEX_GAUGE.set(self.cmd_ctxs.len() as i64);
-        ctx
     }
 
-    pub fn get_ctx_tag(&self, cid: u64) -> &'static str {
-        let ctx = &self.cmd_ctxs[&cid];
-        ctx.tag
-    }
-
-    pub fn fetch_worker_pool(&self, priority: CommandPri) -> &ThreadPool<SchedContext> {
+    pub fn fetch_worker_pool(&self, priority: CommandPri) -> &ThreadPool<SchedContext<E>> {
         match priority {
             CommandPri::Low | CommandPri::Normal => &self.worker_pool,
             CommandPri::High => &self.high_priority_pool,
@@ -246,27 +193,20 @@ impl<E: Engine> Scheduler<E> {
     }
 
     /// Calls the callback with an error.
-    pub fn finish_with_err(&mut self, cid: u64, err: Error) {
-        debug!("command cid={}, finished with error", cid);
+    fn finish_with_err(&mut self, mut rctx: Task, err: Error) {
+        debug!("command cid={}, finished with error", rctx.cid);
         SCHED_STAGE_COUNTER_VEC
-            .with_label_values(&[self.get_ctx_tag(cid), "error"])
+            .with_label_values(&[rctx.tag, "error"])
             .inc();
 
-        let mut ctx = self.remove_ctx(cid);
-        let cb = ctx.callback.take().unwrap();
+        let cb = rctx.callback.take().unwrap();
         let pr = ProcessResult::Failed {
             err: StorageError::from(err),
         };
         execute_callback(cb, pr);
 
-        self.release_lock(&ctx.lock, cid);
-    }
-
-    /// Extracts the context of a command.
-    fn extract_context(&self, cid: u64) -> &Context {
-        let ctx = &self.cmd_ctxs[&cid];
-        assert_eq!(ctx.cid, cid);
-        ctx.cmd.as_ref().unwrap().get_context()
+        self.release_lock(&rctx.lock, rctx.cid);
+        self.on_command_finished(rctx);
     }
 
     /// Event handler for new command.
@@ -333,25 +273,23 @@ impl<E: Engine> Scheduler<E> {
     /// Initiates an async operation to get a snapshot from the storage engine, then posts a
     /// `SnapshotFinished` message back to the event loop when it finishes.
     fn get_snapshot(&mut self, cid: u64) {
-        SCHED_STAGE_COUNTER_VEC
-            .with_label_values(&[self.get_ctx_tag(cid), "snapshot"])
-            .inc();
-        let scheduler = self.scheduler.clone();
-        let cb = box move |(cb_ctx, snapshot)| match scheduler.schedule(Msg::SnapshotFinished {
-            cid,
-            cb_ctx,
-            snapshot,
-        }) {
-            Ok(_) => {}
-            e @ Err(ScheduleError::Stopped(_)) => info!("scheduler worker stopped, err {:?}", e),
-            Err(e) => panic!("schedule SnapshotFinish msg failed, err {:?}", e),
-        };
+        let rctx = self.remove_ctx(cid);
 
-        if let Err(e) = self.engine.async_snapshot(self.extract_context(cid), cb) {
-            SCHED_STAGE_COUNTER_VEC
-                .with_label_values(&[self.get_ctx_tag(cid), "async_snapshot_err"])
-                .inc();
-            self.finish_with_err(cid, Error::from(e));
+        let tag = rctx.tag;
+        SCHED_STAGE_COUNTER_VEC
+            .with_label_values(&[tag, "snapshot"])
+            .inc();
+
+        let ctx = rctx.cmd.as_ref().unwrap().get_context().clone();
+        let scheduler = self.scheduler.clone();
+        let pool_scheduler = self
+            .fetch_worker_pool(rctx.cmd.as_ref().unwrap().priority())
+            .scheduler();
+        let cb = box move |(cb_ctx, snapshot)| {
+            handle_snapshot_finished(rctx, cb_ctx, snapshot, pool_scheduler, scheduler);
+        };
+        if let Err(e) = self.engine.async_snapshot(&ctx, cb) {
+            panic!("engine async_snapshot failed, err: {:?}", e);
         }
     }
 
@@ -359,73 +297,33 @@ impl<E: Engine> Scheduler<E> {
     ///
     /// If a next command is present, continues to execute; otherwise, delivers the result to the
     /// callback.
-    fn on_read_finished(&mut self, cid: u64, pr: ProcessResult) {
-        debug!("read command(cid={}) finished", cid);
-        let mut ctx = self.remove_ctx(cid);
+    fn on_read_finished(&mut self, mut rctx: Task, pr: ProcessResult) {
+        debug!("read command(cid={}) finished", rctx.cid);
         SCHED_STAGE_COUNTER_VEC
-            .with_label_values(&[ctx.tag, "read_finish"])
+            .with_label_values(&[rctx.tag, "read_finish"])
             .inc();
-        let cb = ctx.callback.take().unwrap();
+        let cb = rctx.callback.take().unwrap();
         if let ProcessResult::NextCommand { cmd } = pr {
             SCHED_STAGE_COUNTER_VEC
-                .with_label_values(&[ctx.tag, "next_cmd"])
+                .with_label_values(&[rctx.tag, "next_cmd"])
                 .inc();
             self.schedule_command(cmd, cb);
         } else {
             execute_callback(cb, pr);
         }
 
-        self.release_lock(&ctx.lock, cid);
-    }
-
-    /// Event handler for the failure of write prepare.
-    ///
-    /// Write prepare failure typically means conflicting transactions are detected. Delivers the
-    /// error to the callback, and releases the latches.
-    fn on_write_prepare_failed(&mut self, cid: u64, e: Error) {
-        debug!("write command(cid={}) failed at prewrite.", cid);
-        SCHED_STAGE_COUNTER_VEC
-            .with_label_values(&[self.get_ctx_tag(cid), "prepare_write_err"])
-            .inc();
-        self.finish_with_err(cid, e);
-    }
-
-    /// Event handler for the success of write prepare.
-    ///
-    /// Initiates an async write operation on the storage engine, there'll be a `WriteFinished`
-    /// message when it finishes.
-    fn on_write_prepare_finished(
-        &mut self,
-        cid: u64,
-        cmd_ctx: Context,
-        cmd_tag: &'static str,
-        pr: ProcessResult,
-        to_be_write: Vec<Modify>,
-        rows: usize,
-    ) {
-        SCHED_STAGE_COUNTER_VEC
-            .with_label_values(&[self.get_ctx_tag(cid), "write"])
-            .inc();
-        if to_be_write.is_empty() {
-            return self.on_write_finished(cid, pr, Ok(()));
-        }
-        let engine_cb = make_engine_cb(cmd_tag, cid, pr, self.scheduler.clone(), rows);
-        if let Err(e) = self.engine.async_write(&cmd_ctx, to_be_write, engine_cb) {
-            SCHED_STAGE_COUNTER_VEC
-                .with_label_values(&[self.get_ctx_tag(cid), "async_write_err"])
-                .inc();
-            self.finish_with_err(cid, Error::from(e));
-        }
+        self.release_lock(&rctx.lock, rctx.cid);
+        self.on_command_finished(rctx);
     }
 
     /// Event handler for the success of write.
-    fn on_write_finished(&mut self, cid: u64, pr: ProcessResult, result: EngineResult<()>) {
+    fn on_write_finished(&mut self, mut rctx: Task, pr: ProcessResult, result: EngineResult<()>) {
         SCHED_STAGE_COUNTER_VEC
-            .with_label_values(&[self.get_ctx_tag(cid), "write_finish"])
+            .with_label_values(&[rctx.tag, "write_finish"])
             .inc();
-        debug!("write finished for command, cid={}", cid);
-        let mut ctx = self.remove_ctx(cid);
-        let cb = ctx.callback.take().unwrap();
+        debug!("write finished for command, cid={}", rctx.cid);
+        // let mut ctx = self.remove_ctx(cid);
+        let cb = rctx.callback.take().unwrap();
         let pr = match result {
             Ok(()) => pr,
             Err(e) => ProcessResult::Failed {
@@ -434,14 +332,15 @@ impl<E: Engine> Scheduler<E> {
         };
         if let ProcessResult::NextCommand { cmd } = pr {
             SCHED_STAGE_COUNTER_VEC
-                .with_label_values(&[ctx.tag, "next_cmd"])
+                .with_label_values(&[rctx.tag, "next_cmd"])
                 .inc();
             self.schedule_command(cmd, cb);
         } else {
             execute_callback(cb, pr);
         }
 
-        self.release_lock(&ctx.lock, cid);
+        self.release_lock(&rctx.lock, rctx.cid);
+        self.on_command_finished(rctx);
     }
 
     /// Releases all the latches held by a command.
@@ -461,12 +360,12 @@ impl<E: Engine> Scheduler<E> {
     }
 }
 
-impl<E: Engine> Runnable<Msg<E>> for Scheduler<E> {
-    fn run(&mut self, _: Msg<E>) {
+impl<E: Engine> Runnable<Msg> for Scheduler<E> {
+    fn run(&mut self, _: Msg) {
         unimplemented!()
     }
 
-    fn run_batch(&mut self, msgs: &mut Vec<Msg<E>>) {
+    fn run_batch(&mut self, msgs: &mut Vec<Msg>) {
         for msg in msgs.drain(..) {
             match msg {
                 Msg::Quit => {
@@ -474,24 +373,11 @@ impl<E: Engine> Runnable<Msg<E>> for Scheduler<E> {
                     return;
                 }
                 Msg::RawCmd { cmd, cb } => self.on_receive_new_cmd(cmd, cb),
-                Msg::SnapshotFinished {
-                    cid,
-                    cb_ctx,
-                    snapshot,
-                } => self.on_snapshot_finished(cid, cb_ctx, snapshot),
-                Msg::ReadFinished { cid, pr } => self.on_read_finished(cid, pr),
-                Msg::WritePrepareFinished {
-                    cid,
-                    ctx,
-                    tag,
-                    pr,
-                    to_be_write,
-                    rows,
-                } => self.on_write_prepare_finished(cid, ctx, tag, pr, to_be_write, rows),
-                Msg::WritePrepareFailed { cid, err } => self.on_write_prepare_failed(cid, err),
+                Msg::ReadFinished { rctx, pr } => self.on_read_finished(rctx, pr),
                 Msg::WriteFinished {
-                    cid, pr, result, ..
-                } => self.on_write_finished(cid, pr, result),
+                    rctx, pr, result, ..
+                } => self.on_write_finished(rctx, pr, result),
+                Msg::FinishedWithErr { rctx, err } => self.finish_with_err(rctx, err),
             }
         }
     }
